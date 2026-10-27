@@ -300,7 +300,11 @@ function put(kind, obj, fromPeer){
   if(!fromPeer) peerSend({t:"put", kind, obj});
   if (dbCol){ const ref=dbCol.doc(kind+"-"+obj.id); const data=JSON.parse(JSON.stringify(obj)); data.kind=kind; queueWrite(ref.path, ()=>ref.set(data)); }
 }
+let clearingLive=false;
+function clearBrokenLive(){ if (clearingLive) return; clearingLive=true; setTimeout(()=>{ clearingLive=false; if(ui.cam) closeScanner(); setLive(null); renderTabs(); }, 0); }
 function del(kind, id, fromPeer){
+  const ls = S.live && S.sessions[S.live.sid];
+  if (ls && (ls.quizId===id || ls.classId===id || ls.id===id)){ if(ui.cam) closeScanner(); setLive(null, fromPeer); }
   delete S[KIND[kind]][id]; S.deleted=S.deleted||{}; S.deleted[id]=Date.now(); saveLocal();
   if(!fromPeer) peerSend({t:"del", kind, id});
   if (dbCol){ const ref=dbCol.doc(kind+"-"+id); queueWrite(ref.path, ()=>ref.delete()); }
@@ -733,10 +737,14 @@ async function saveFile(filename, data){
 /* ---------- 4. Live session ---------- */
 function viewSession(){
   const L=S.live, s=L&&S.sessions[L.sid];
-  if (!L || !s) return viewSessionSetup();
+  if (!L || !s){ if (L) clearBrokenLive(); return viewSessionSetup(); }
   const c=S.classes[s.classId]; const q=S.quizzes[s.quizId];
   const qs=s.qids.map(id=>q?.questions.find(x=>x.id===id)).filter(Boolean);
-  const qi=Math.min(L.qi, qs.length-1), Q=qs[qi];
+  if (!c || !q || !qs.length){
+    clearBrokenLive();
+    return `<div class="note">Buổi học “${esc(s.name)}” đã được đóng vì ${!q||!qs.length?"đề":"lớp"} của buổi đó đã bị xoá hoặc thay mới. Hãy tạo buổi học mới bên dưới.</div>` + viewSessionSetup();
+  }
+  const qi=Math.max(0, Math.min(L.qi, qs.length-1)), Q=qs[qi];
   return `
   <div class="sbar">
     <div><div class="small" style="opacity:.8">${esc(s.name)} · ${esc(c?.name||"")}</div><div class="qnum">Câu ${qi+1}/${qs.length}</div></div>
@@ -1065,7 +1073,7 @@ document.addEventListener("click", async e => {
     case "pdf": return makePdf();
     case "selAll": case "selNone": document.querySelectorAll("[data-sq]").forEach(x=>x.checked=a==="selAll"); return;
     case "start": return startSession();
-    case "prevQ": case "nextQ": { const L=S.live; setLive({...L, qi:L.qi+(a==="nextQ"?1:-1), reveal:false}); ui.lastShot=null; ui.scanMsg=""; for(const k in seen) delete seen[k]; if(ui.cam){ updateScannerHud(); updateLivePanels(); return; } return render(); }
+    case "prevQ": case "nextQ": { const L=S.live; const ss=S.sessions[L.sid]; const nq=ss?ss.qids.length:1; const nqi=Math.max(0,Math.min(nq-1,(L.qi||0)+(a==="nextQ"?1:-1))); if(nqi===L.qi) return; setLive({...L, qi:nqi, reveal:false}); ui.lastShot=null; ui.scanMsg=""; for(const k in seen) delete seen[k]; if(ui.cam){ updateScannerHud(); updateLivePanels(); return; } return render(); }
     case "reveal": setLive({...S.live, reveal:!S.live.reveal}); if(ui.cam){ updateScannerHud(); updateLivePanels(); return; } return render();
     case "present": { document.body.classList.toggle("present"); if(document.body.classList.contains("present")){ try{ await document.documentElement.requestFullscreen?.(); }catch(_){} toast("Bấm Esc hoặc nút “Thoát trình chiếu” để quay lại"); ensureExitBtn(); } return; }
     case "end": ui.confirm="end"; return render();
