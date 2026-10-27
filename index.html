@@ -590,7 +590,7 @@ function viewClasses(){
       </div>
       ${ui.xlsInfo?`<div class="note small">${ui.xlsInfo}</div>`:""}
       <label class="f">Hoặc dán danh sách (dán cột họ tên từ Excel, mỗi dòng một em — cột STT nếu có sẽ tự bỏ)
-        <textarea id="paste" placeholder="Nguyễn Minh Anh&#10;Trần Gia Bảo&#10;Lê Ngọc Châu"></textarea></label>
+        <textarea id="paste" placeholder="Nguyễn Minh Anh&#10;Trần Gia Bảo&#10;Lê Ngọc Châu">${esc(ui.pasteDraft||"")}</textarea></label>
       <div class="row"><button class="btn primary" data-act="import">Thêm vào cuối danh sách</button><button class="btn" data-act="replace">Thay toàn bộ danh sách</button></div>
       <div class="note">Thứ tự dán vào = số thẻ. Em học sinh mới chuyển đến hãy thêm vào <b>cuối</b> danh sách để không làm đổi số thẻ của các em khác.</div>
       ${c.students.length?`<div class="scroll-x"><table><thead><tr><th>Số thẻ</th><th>Họ và tên</th><th></th></tr></thead><tbody>
@@ -605,6 +605,7 @@ after.lop = () => {
     const name=$("#cName").value.trim(); if(!name) return;
     const c={id:uid(), name, grade:$("#cGrade").value.trim(), subject:$("#cSubj").value.trim(), students:[], created:Date.now()};
     put("c",c); ui.classId=c.id; render(); toast("Đã tạo lớp "+name); $("#paste")?.focus(); });
+  $("#paste")?.addEventListener("input", e=>{ ui.pasteDraft=e.target.value; });
   document.querySelectorAll("[data-stu]").forEach(inp=>inp.addEventListener("change",()=>{ const c=S.classes[ui.classId]; c.students[+inp.dataset.stu]=inp.value.trim(); put("c",c); }));
 };
 function parseNames(t){
@@ -1046,7 +1047,7 @@ document.addEventListener("click", async e => {
   switch(a){
     case "examples": return addExamples();
     case "cancel": ui.confirm=null; return render();
-    case "import": case "replace": { const names=parseNames($("#paste").value); if(!names.length){ toast("Chưa có tên nào để nhập."); return; } ui.xlsInfo="";
+    case "import": case "replace": { const names=parseNames($("#paste").value); if(!names.length){ toast("Chưa có tên nào để nhập."); return; } ui.xlsInfo=""; ui.pasteDraft="";
       c.students = a==="replace"? names : c.students.concat(names); put("c",c); render(); toast(`Lớp ${c.name} có ${c.students.length} em`); return; }
     case "popStu": c.students.pop(); put("c",c); return render();
     case "delClass": ui.confirm="delClass"; return render();
@@ -1110,6 +1111,59 @@ $("#docxIn").addEventListener("change", async e=>{
     const un=qs.filter(x=>x.unsure).length;
     toast(un? `Đã tách ${qs.length} câu · ${qs.length-un} câu có đáp án · ${un} câu cần chọn đáp án` : `Đã tách ${qs.length} câu, đủ đáp án`);
   }catch(err){ console.warn(err); toast("Không đọc được tệp này. Hãy lưu lại dạng .docx rồi thử lại."); }
+});
+/* Excel student list import */
+function norm(s){ return String(s??"").normalize("NFC").toLowerCase().replace(/\s+/g," ").trim(); }
+function namesFromRows(rows){
+  rows = rows.map(r=>(r||[]).map(v=>String(v??"").replace(/\s+/g," ").trim()));
+  let hr=-1, full=-1, ho=-1, ten=-1;
+  for (let r=0;r<Math.min(rows.length,30)&&hr<0;r++){
+    full=-1; ho=-1; ten=-1;
+    rows[r].forEach((v,c)=>{ const n=norm(v);
+      if (full<0 && /^(họ\s*(và|&|\+)?\s*tên(\s*(học sinh|hs))?|tên học sinh|học sinh|full ?name|name)$/.test(n)) full=c;
+      else if (ho<0 && /^(họ|họ đệm|họ lót|họ và đệm|họ và tên đệm|họ và chữ đệm)$/.test(n)) ho=c;
+      else if (ten<0 && /^(tên|first ?name)$/.test(n)) ten=c; });
+    // "Họ và tên" header merged over two columns, with "Họ đệm" | "Tên" (or blank) underneath
+    if (full>=0 && rows[r+1]){ const sub=rows[r+1].map(norm);
+      if (/^(họ|họ đệm|họ lót|họ và đệm)$/.test(sub[full]||"") && /^tên$/.test(sub[full+1]||"")){ ho=full; ten=full+1; full=-1; r++; } }
+    if (full>=0 || (ho>=0&&ten>=0)) hr=r;
+  }
+  const isName = v => v && /[a-zA-ZÀ-ỹ]/.test(v) && !/^\d+([.,]\d+)?$/.test(v) && v.length<=60 && !/@/.test(v);
+  if (hr<0){
+    full=-1; const score={};
+    rows.slice(0,300).forEach(r=>r.forEach((v,c)=>{ if(isName(v)&&/\S\s+\S/.test(v)) score[c]=(score[c]||0)+1; }));
+    const best=Object.entries(score).sort((a,b)=>b[1]-a[1])[0]; if(!best) return {names:[], how:""};
+    full=+best[0];
+  }
+  // a "Họ và tên" column whose cells hold only the family part, with the given name in the next column
+  if (full>=0 && hr>=0){
+    const body=rows.slice(hr+1).filter(r=>isName(r[full]));
+    const nextOneWord = body.filter(r=>r[full+1] && /^[A-Za-zÀ-ỹ]+$/.test(r[full+1])).length;
+    if (body.length && nextOneWord/body.length>0.8 && !(rows[hr][full+1]||"").trim()){ ho=full; ten=full+1; full=-1; }
+  }
+  const out=[];
+  for (let r=hr+1;r<rows.length;r++){
+    const row=rows[r]; let v = full>=0 ? row[full] : [row[ho],row[ten]].filter(Boolean).join(" ");
+    v=(v||"").replace(/\s+/g," ").trim();
+    if (!isName(v)) continue;
+    if (/^(tổng|cộng|ghi chú|người lập|giáo viên|gvcn|hiệu trưởng|danh sách|lớp\b|sĩ số|nam\b|nữ\b)/i.test(v)) continue;
+    out.push(v);
+  }
+  const head=rows[hr]||[];
+  const how = hr<0 ? "không có dòng tiêu đề, đã chọn cột trông giống họ tên nhất" : full>=0 ? `cột “${head[full]}”` : `ghép cột họ đệm + tên`;
+  return {names:out, how};
+}
+$("#xlsIn").addEventListener("change", async e=>{
+  const f=e.target.files[0]; e.target.value=""; if(!f) return;
+  if (!window.XLSX){ toast("Không tải được bộ đọc Excel. Kiểm tra mạng rồi tải lại trang."); return; }
+  try{
+    const wb = XLSX.read(await f.arrayBuffer(), {type:"array"});
+    let best={names:[],how:"",sheet:""};
+    for (const sn of wb.SheetNames){ const rows=XLSX.utils.sheet_to_json(wb.Sheets[sn],{header:1,raw:false,defval:"",blankrows:true}); const r=namesFromRows(rows); if(r.names.length>best.names.length) best={...r,sheet:sn}; }
+    if (!best.names.length){ toast("Không tìm thấy cột họ tên trong file này."); return; }
+    ui.xlsInfo = `Đã đọc <b>${best.names.length} học sinh</b> từ “${esc(f.name)}”${wb.SheetNames.length>1?`, trang “${esc(best.sheet)}”`:""} (${esc(best.how)}). Kiểm tra danh sách bên dưới rồi bấm <b>Thêm vào cuối danh sách</b> hoặc <b>Thay toàn bộ danh sách</b>.`;
+    ui.pasteDraft = best.names.join("\n"); render(); $("#paste")?.focus();
+  }catch(err){ console.warn(err); toast("Không đọc được file. Hãy lưu lại dạng .xlsx rồi thử lại."); }
 });
 $("#backupIn").addEventListener("change", async e=>{
   const f=e.target.files[0]; e.target.value=""; if(!f) return;
