@@ -161,6 +161,14 @@ body.present .qtext{font-size:clamp(1.4rem,3.2vw,2.6rem)}
 body.present .ans .a{font-size:clamp(1rem,2vw,1.5rem)}
 body.present .bars{height:30vh}
 
+.link-btn{border:0;color:inherit;cursor:pointer;font:inherit;font-size:.78rem;font-weight:600}
+.link-btn.on i{background:#6fe0a6}
+.modal{position:fixed;inset:0;z-index:35;background:rgba(0,0,0,.55);display:grid;place-items:center;padding:16px max(16px,env(safe-area-inset-right,0px)) 16px max(16px,env(safe-area-inset-left,0px))}
+.modal-card{background:var(--surface);color:var(--ink);border-radius:14px;padding:20px;width:min(460px,100%);display:grid;gap:12px;max-height:90vh;overflow:auto}
+.qr{background:#fff;padding:14px;border-radius:10px;justify-self:center;line-height:0}
+.qr img,.qr canvas{width:220px;height:220px;max-width:100%}
+.code{font-family:var(--f-mono);font-size:1.6rem;font-weight:700;letter-spacing:.12em;text-align:center}
+.steps{margin:0;padding-left:20px;display:grid;gap:4px;color:var(--muted);font-size:.9rem}
 /* Full-screen scanner: always dark, it sits on a live camera image */
 .scanner{position:fixed;inset:0;z-index:30;background:#000;color:#fff}
 .sc-view{position:absolute;inset:0}
@@ -203,7 +211,7 @@ body.present .bars{height:30vh}
         <div class="logo-mark" aria-hidden="true"><canvas id="logoCv" width="26" height="26"></canvas></div>
         <h1>Giơ Thẻ<small>Thẻ trả lời giấy · quét bằng camera</small></h1>
       </div>
-      <div class="sync" id="sync"><i></i><span>Lưu trên máy này</span></div>
+      <div class="row" style="gap:8px"><button class="sync link-btn" id="linkBtn" data-act="link" hidden><i></i><span>Kết nối điện thoại</span></button><div class="sync" id="sync"><i></i><span>Lưu trên máy này</span></div></div>
     </div>
     <nav class="tabs" role="tablist" id="tabs"></nav>
   </div>
@@ -237,6 +245,12 @@ body.present .bars{height:30vh}
     </div>
   </div>
 </div>
+<div id="linkModal" class="modal" hidden role="dialog" aria-labelledby="linkTitle">
+  <div class="modal-card">
+    <div class="row" style="justify-content:space-between;align-items:flex-start"><h3 id="linkTitle">Kết nối điện thoại</h3><button class="btn ghost" data-act="linkClose" aria-label="Đóng">✕</button></div>
+    <div id="linkBody"></div>
+  </div>
+</div>
 <div id="toast" class="toast" hidden></div>
 <input type="file" id="photoIn" accept="image/*" capture="environment" hidden>
 <input type="file" id="photoLib" accept="image/*" multiple hidden>
@@ -247,8 +261,10 @@ body.present .bars{height:30vh}
 <script src="https://cdn.jsdelivr.net/npm/js-aruco2@2.0.0/src/cv.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/js-aruco2@2.0.0/src/aruco.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
 "use strict";
 /* ================= helpers ================= */
@@ -260,7 +276,7 @@ let toastT;
 function toast(msg){ const t=$("#toast"); t.textContent=msg; t.hidden=false; clearTimeout(toastT); toastT=setTimeout(()=>t.hidden=true,2600); }
 
 /* ================= store (local + optional synced db) ================= */
-const S = { classes:{}, quizzes:{}, sessions:{}, live:null };
+const S = { classes:{}, quizzes:{}, sessions:{}, live:null, deleted:{} };
 const LS_KEY = "giothe.v1";
 let dbCol = null, synced = false;
 function loadLocal(){ try{ const d=JSON.parse(localStorage.getItem(LS_KEY)||"null"); if(d){ Object.assign(S,d); } }catch(e){} }
@@ -278,24 +294,30 @@ function queueWrite(id, fn){
     w.busy = false;
   })();
 }
-function put(kind, obj){
+function put(kind, obj, fromPeer){
+  if(!fromPeer) obj.updated = Date.now();
   S[KIND[kind]][obj.id] = obj; saveLocal();
+  if(!fromPeer) peerSend({t:"put", kind, obj});
   if (dbCol){ const ref=dbCol.doc(kind+"-"+obj.id); const data=JSON.parse(JSON.stringify(obj)); data.kind=kind; queueWrite(ref.path, ()=>ref.set(data)); }
 }
-function del(kind, id){
-  delete S[KIND[kind]][id]; saveLocal();
+function del(kind, id, fromPeer){
+  delete S[KIND[kind]][id]; S.deleted=S.deleted||{}; S.deleted[id]=Date.now(); saveLocal();
+  if(!fromPeer) peerSend({t:"del", kind, id});
   if (dbCol){ const ref=dbCol.doc(kind+"-"+id); queueWrite(ref.path, ()=>ref.delete()); }
 }
-function setLive(live){
+function setLive(live, fromPeer){
+  if (live && !fromPeer) live.updated = Date.now();
   S.live = live; saveLocal();
+  if(!fromPeer) peerSend({t:"live", live});
   if (dbCol){ const ref=dbCol.doc("live"); queueWrite(ref.path, ()=> live ? ref.set(live) : ref.delete()); }
 }
 // record answers into a session (merge-safe for two devices)
 const pendingAns = {};
-function recordAnswers(sid, qi, map){
+function recordAnswers(sid, qi, map, fromPeer){
   const s = S.sessions[sid]; if(!s) return;
   s.answers = s.answers || {}; s.answers[qi] = Object.assign({}, s.answers[qi]||{}, map);
   saveLocal();
+  if(!fromPeer) peerSend({t:"ans", sid, qi, map});
   if (dbCol){
     const key = sid+"|"+qi; pendingAns[key] = Object.assign(pendingAns[key]||{}, map);
     const ref = dbCol.doc("s-"+sid);
@@ -409,50 +431,83 @@ function detectCanvas(cv, maxCards=999){
   return [...found.values()];
 }
 
-/* ================= quiz text parser (Word / pasted) ================= */
-function parseQuiz(raw){
-  let text = raw.replace(/\r/g,"").replace(/ /g," ");
-  // answer key: "Đáp án: 1B 2C 3-A" / "1.B, 2.C"
-  const key = {};
-  const km = [...text.matchAll(/(?:^|\n)\s*(?:bảng\s*)?đáp\s*án\s*[:\n]/gi)].map(m=>{ const tail=text.slice(m.index+m[0].length); return Object.assign([m[0],tail],{index:m.index}); }).filter(m=>!/Câu\s*\d/i.test(m[1])).pop();
-  if (km && /\d+\s*[-.:)]?\s*[A-D]\b/i.test(km[1])){
-    km[1].replace(/(\d+)\s*[-.:)]?\s*([A-D])\b/gi,(_,n,l)=>{ key[+n]=LET.indexOf(l.toUpperCase()); });
-    text = text.slice(0, km.index);
-  }
-  const parts = text.split(/(?:^|\n)\s*Câu\s*(\d+)\s*[:.)]?/i);
+/* ================= quiz parser (Word / pasted) =================
+   fmt (optional) = per-character formatting bits from the Word file:
+   1 coloured text, 2 highlight/shading, 4 underline, 8 bold, 16 italic.
+   The correct option is the one formatted differently from the other three. */
+const F_COLOR=1,F_HL=2,F_U=4,F_B=8,F_I=16;
+function parseQuiz(text, fmt){
+  text = text.replace(/\r/g,"").replace(/ /g," ");
+  if (fmt && fmt.length!==text.length) fmt=null;
+  // answer key at the end: "Đáp án: 1B 2C 3-A" / "BẢNG ĐÁP ÁN" table
+  const key={}; let end=text.length;
+  const keys=[...text.matchAll(/(?:^|\n)[ \t]*(?:bảng\s*)?đáp\s*án\s*(?:[:\n]|$)/gi)].filter(m=>!/Câu\s*\d/i.test(text.slice(m.index+m[0].length)));
+  const km=keys[0];
+  if (km){ const tail=text.slice(km.index+km[0].length);
+    if (/\d+\s*[-.:)]?\s*[A-D]\b/i.test(tail)){ tail.replace(/(\d+)\s*[-.:)]?\s*([A-D])\b/gi,(_,n,l)=>{ key[+n]=LET.indexOf(l.toUpperCase()); }); end=km.index; } }
+  // question starts: "Câu 12:" (or "12." lines when the file has no "Câu")
+  let starts=[...text.slice(0,end).matchAll(/(^|\n)[ \t]*Câu\s*(\d+)\s*[:.)]?/gi)].map(m=>({n:+m[2], at:m.index+m[1].length, body:m.index+m[0].length}));
+  if (!starts.length) starts=[...text.slice(0,end).matchAll(/(^|\n)[ \t]*(\d{1,3})\s*[.)]\s/g)].map(m=>({n:+m[2], at:m.index+m[1].length, body:m.index+m[0].length}));
   const qs=[];
-  for (let i=1;i<parts.length;i+=2){
-    const n=+parts[i]; let body=parts[i+1]||"";
-    let correct=-1;
-    const ln = body.match(/\n\s*(?:đáp\s*án|chọn)\s*[:\-]?\s*⟦?\s*([A-D])\b/i);
-    if (ln){ correct=LET.indexOf(ln[1].toUpperCase()); body=body.slice(0,ln.index); }
-    // option markers: start-of-line or whitespace, optional * or ⟦, letter, . or )
-    const re=/(^|\n|\s)(\*?⟦?\*?)\s*([A-D])\s*[.)]\s/g; let m; const marks=[];
-    while((m=re.exec(body))){ const L=m[3]; if(marks.length===LET.indexOf(L)) marks.push({L, idx:m.index+m[1].length, start:re.lastIndex, star:/[*⟦]/.test(m[2])}); }
-    if (marks.length<2) continue;
-    const stem = body.slice(0, marks[0].idx);
-    const o = marks.map((mk,j)=>{ const end = j+1<marks.length? marks[j+1].idx : body.length; return body.slice(mk.start,end); });
-    o.forEach((s,j)=>{ if(correct<0 && (marks[j].star || /^\s*⟦/.test(s))) correct=j; });
-    const clean = s => s.replace(/[⟦⟧]/g,"").replace(/\s+/g," ").trim();
-    if (correct<0 && key[n]!=null) correct=key[n];
-    while (o.length<4) o.push("");
-    qs.push({id:uid(), t:clean(stem), o:o.slice(0,4).map(clean), c:correct<0?0:correct, unsure:correct<0});
-  }
+  starts.forEach((st,qi)=>{
+    const bEnd = qi+1<starts.length? starts[qi+1].at : end;
+    let body=text.slice(st.body,bEnd); const base=st.body;
+    let correct=-1, how="";
+    const ln = body.match(/\n[ \t]*(?:đáp\s*án|chọn)\s*(?:đúng)?\s*[:\-]?\s*\*?\s*([A-D])\b/i);
+    if (ln){ correct=LET.indexOf(ln[1].toUpperCase()); how="line"; body=body.slice(0,ln.index); }
+    const re=/(^|\n|[ \t])(\*?)[ \t]*([A-D])[ \t]*[.):][ \t]?/g; let m; const marks=[];
+    while((m=re.exec(body))){ const L=m[3]; if(marks.length===LET.indexOf(L)) marks.push({letterAt:m.index+m[1].length+m[2].length+(m[0].slice(m[1].length+m[2].length).search(/[A-D]/)), idx:m.index+m[1].length, start:re.lastIndex, star:!!m[2]}); }
+    if (marks.length<2) return;
+    const opts = marks.map((mk,j)=>{ const e = j+1<marks.length? marks[j+1].idx : body.length; return {s:mk.idx, e, text:body.slice(mk.start,e)}; });
+    if (correct<0){ const j=marks.findIndex(x=>x.star); if(j>=0){ correct=j; how="star"; } }
+    if (correct<0 && fmt){
+      for (const bit of [F_HL,F_COLOR,F_U,F_B,F_I]){
+        const has = opts.map((o,j)=>{ let n=0,k=0; for(let i=o.s;i<o.e;i++){ if(/\s/.test(body[i])) continue; n++; if(fmt[base+i]&bit) k++; }
+          return (n && k/n>=0.6) || !!(fmt[base+marks[j].letterAt]&bit); });
+        if (has.filter(Boolean).length===1){ correct=has.indexOf(true); how="format"; break; }
+      }
+    }
+    if (correct<0 && key[st.n]!=null){ correct=key[st.n]; how="key"; }
+    const clean=s=>s.replace(/\s+/g," ").trim();
+    const o=opts.map(x=>clean(x.text)); while(o.length<4) o.push("");
+    qs.push({id:uid(), t:clean(body.slice(0,marks[0].idx)), o:o.slice(0,4), c:correct<0?0:correct, unsure:correct<0});
+  });
   return qs;
 }
-async function docxToText(file){
-  const buf = await file.arrayBuffer();
-  if (!window.mammoth) throw new Error("no mammoth");
-  const res = await mammoth.convertToHtml({arrayBuffer:buf});
-  let html = res.value
-    .replace(/<(u|strong|b)>/g,"⟦").replace(/<\/(u|strong|b)>/g,"⟧")
-    .replace(/<\/(p|li|h\d|tr)>/g,"\n").replace(/<br\s*\/?>/g,"\n").replace(/<\/t[dh]>/g," ");
-  const d=document.createElement("div"); d.innerHTML=html; let t=d.textContent;
-  // bold "Câu 1" is common: drop marks that only wrap the question label
-  t = t.replace(/⟦\s*(Câu\s*\d+\s*[:.)]?)\s*⟧/gi,"$1").replace(/⟦(\s*)⟧/g,"$1");
-  return t;
+// read a .docx directly so colour, highlight, underline and bold survive
+async function docxRead(file){
+  if (!window.JSZip) throw new Error("no jszip");
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) throw new Error("not a docx");
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  const W="http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+  const attr=(el,n)=> el ? (el.getAttributeNS(W,n) ?? el.getAttribute("w:"+n)) : null;
+  const child=(el,n)=> el ? [...el.children].find(c=>c.localName===n) : null;
+  const on=(el)=>{ if(!el) return false; const v=attr(el,"val"); return v==null || !/^(0|false|none|off)$/i.test(v); };
+  let text="", fmt=[];
+  const push=(t,f)=>{ text+=t; for(let i=0;i<t.length;i++) fmt.push(f); };
+  for (const p of doc.getElementsByTagNameNS(W,"p")){
+    for (const r of p.getElementsByTagNameNS(W,"r")){
+      if (r.parentElement && r.parentElement.localName==="del") continue;
+      const pr=child(r,"rPr"); let f=0;
+      const col=attr(child(pr,"color"),"val"); if (col && !/^(auto|0{6}|000000)$/i.test(col)) f|=F_COLOR;
+      const hl=child(pr,"highlight"); if (hl && !/^none$/i.test(attr(hl,"val")||"")) f|=F_HL;
+      const shd=attr(child(pr,"shd"),"fill"); if (shd && !/^(auto|ffffff)$/i.test(shd)) f|=F_HL;
+      const u=child(pr,"u"); if (u && !/^none$/i.test(attr(u,"val")||"single")) f|=F_U;
+      if (on(child(pr,"b"))) f|=F_B;
+      if (on(child(pr,"i"))) f|=F_I;
+      for (const c of r.children){
+        if (c.localName==="t") push(c.textContent, f);
+        else if (c.localName==="tab") push(" ", f);
+        else if (c.localName==="br" || c.localName==="cr") push("\n", 0);
+      }
+    }
+    // table cells: each cell is its own paragraph, keep options apart
+    push("\n", 0);
+  }
+  return {text, fmt};
 }
-
 /* ================= UI state ================= */
 const ui = { xlsInfo:"", tab:"lop", classId:null, quizId:null, resultId:null, cardMode:"class", perPage:2, deckSize:40, confirm:null, lastShot:null, cam:false };
 const TABS = [["lop","Lớp học"],["de","Đề"],["in","In thẻ"],["buoi","Buổi học"],["kq","Kết quả"]];
@@ -543,7 +598,7 @@ function viewQuizzes(){
   if (!ui.quizId || !S.quizzes[ui.quizId]) ui.quizId = qz[0]?.id || null;
   const q = S.quizzes[ui.quizId];
   return `
-  <div class="head"><div><h2>Đề trắc nghiệm</h2><p>Mỗi câu 4 phương án A/B/C/D. Có thể soạn tay, dán chữ, hoặc chọn tệp Word (.docx) — đáp án đúng đánh dấu bằng gạch chân, in đậm, dấu * trước chữ cái, dòng "Đáp án: B" hoặc bảng đáp án cuối đề.</p></div></div>
+  <div class="head"><div><h2>Đề trắc nghiệm</h2><p>Mỗi câu 4 phương án A/B/C/D. Có thể soạn tay, dán chữ, hoặc chọn tệp Word (.docx) — app tự nhận đáp án đúng khi phương án đó được <b>tô màu chữ, tô sáng (highlight), gạch chân hoặc in đậm</b> khác với 3 phương án còn lại, có dấu * trước chữ cái, có dòng "Đáp án: B", hoặc có bảng đáp án cuối đề.</p></div></div>
   <div class="grid2">
     <section class="panel stack">
       <div class="row"><button class="btn primary" data-act="newQuiz">+ Đề mới</button><button class="btn" data-act="pickDocx">Chọn tệp Word…</button></div>
@@ -997,6 +1052,10 @@ document.addEventListener("click", async e => {
     case "shoot": return $("#photoIn").click();
     case "pickPhotos": return $("#photoLib").click();
     case "cam": return openScanner();
+    case "link": return link.role==="host" ? showLinkModal() : (showLinkModal());
+    case "linkHost": return startHost();
+    case "linkClose": $("#linkModal").hidden=true; return;
+    case "linkStop": stopLink(true); $("#linkModal").hidden=true; toast("Đã ngắt kết nối"); return;
     case "scClose": return closeScanner();
     case "scTorch": return toggleTorch();
     case "scShoot": closeScanner(); return $("#photoIn").click();
@@ -1021,58 +1080,16 @@ $("#photoIn").addEventListener("change", e=>{ handlePhotos([...e.target.files]);
 $("#photoLib").addEventListener("change", e=>{ handlePhotos([...e.target.files]); e.target.value=""; });
 $("#docxIn").addEventListener("change", async e=>{
   const f=e.target.files[0]; e.target.value=""; if(!f) return;
+  if (/\.doc$/i.test(f.name)){ toast("Tệp .doc (Word cũ) chưa đọc được. Mở bằng Word → Lưu thành .docx rồi chọn lại."); return; }
   try{
     toast("Đang đọc tệp…");
-    const text = /\.txt$/i.test(f.name) ? await f.text() : await docxToText(f);
-    const qs=parseQuiz(text);
+    const r = /\.txt$/i.test(f.name) ? {text:await f.text(), fmt:null} : await docxRead(f);
+    const qs=parseQuiz(r.text, r.fmt);
     if(!qs.length){ toast("Không tìm thấy câu trắc nghiệm nào. Mỗi câu cần bắt đầu bằng “Câu 1:” và có A. B. C. D."); return; }
     newQuizFrom(f.name.replace(/\.(docx|txt)$/i,""), qs);
     const un=qs.filter(x=>x.unsure).length;
-    toast(`Đã tách ${qs.length} câu${un?` · ${un} câu cần chọn đáp án`:""}`);
+    toast(un? `Đã tách ${qs.length} câu · ${qs.length-un} câu có đáp án · ${un} câu cần chọn đáp án` : `Đã tách ${qs.length} câu, đủ đáp án`);
   }catch(err){ console.warn(err); toast("Không đọc được tệp này. Hãy lưu lại dạng .docx rồi thử lại."); }
-});
-/* Excel student list import */
-function norm(s){ return String(s??"").normalize("NFC").toLowerCase().replace(/\s+/g," ").trim(); }
-function namesFromRows(rows){
-  rows = rows.map(r=>(r||[]).map(v=>String(v??"").replace(/\s+/g," ").trim()));
-  let hr=-1, full=-1, ho=-1, ten=-1;
-  for (let r=0;r<Math.min(rows.length,20)&&hr<0;r++){
-    rows[r].forEach((v,c)=>{ const n=norm(v);
-      if (full<0 && /^(họ\s*(và|&|\+)?\s*tên|họ tên học sinh|họ và tên học sinh|tên học sinh|học sinh|full ?name|name)$/.test(n)) full=c;
-      else if (ho<0 && /^(họ|họ đệm|họ lót|họ và đệm|họ và tên đệm)$/.test(n)) ho=c;
-      else if (ten<0 && /^(tên|first ?name)$/.test(n)) ten=c; });
-    if (full>=0 || (ho>=0&&ten>=0)) hr=r; else { full=-1; ho=-1; ten=-1; }
-  }
-  const isName = v => v && /[a-zA-ZÀ-ỹ]/.test(v) && !/^\d+([.,]\d+)?$/.test(v) && v.length<=60;
-  if (hr<0){ // no header: pick the column that looks most like names (letters + spaces, 2+ words)
-    const score={};
-    rows.slice(0,200).forEach(r=>r.forEach((v,c)=>{ if(isName(v)&&/\S\s+\S/.test(v)&&!/@/.test(v)) score[c]=(score[c]||0)+1; }));
-    const best=Object.entries(score).sort((a,b)=>b[1]-a[1])[0]; if(!best) return {names:[], how:""};
-    full=+best[0];
-  }
-  const out=[];
-  for (let r=hr+1;r<rows.length;r++){
-    const row=rows[r]; let v = full>=0 ? row[full] : [row[ho],row[ten]].filter(Boolean).join(" ");
-    v=(v||"").trim();
-    if (!isName(v)) continue;
-    if (/^(tổng|cộng|ghi chú|người lập|giáo viên|gvcn|hiệu trưởng)/i.test(v)) continue;
-    out.push(v);
-  }
-  const head=rows[hr]||[];
-  const how = hr<0 ? "không có dòng tiêu đề, đã chọn cột trông giống họ tên nhất" : full>=0 ? `cột “${head[full]}”` : `ghép cột “${head[ho]}” + “${head[ten]}”`;
-  return {names:out, how};
-}
-$("#xlsIn").addEventListener("change", async e=>{
-  const f=e.target.files[0]; e.target.value=""; if(!f) return;
-  if (!window.XLSX){ toast("Không tải được bộ đọc Excel. Kiểm tra mạng rồi tải lại trang."); return; }
-  try{
-    const wb = XLSX.read(await f.arrayBuffer(), {type:"array", codepage:65001});
-    let best={names:[],how:"",sheet:""};
-    for (const sn of wb.SheetNames){ const rows=XLSX.utils.sheet_to_json(wb.Sheets[sn],{header:1,raw:false,defval:""}); const r=namesFromRows(rows); if(r.names.length>best.names.length) best={...r,sheet:sn}; }
-    if (!best.names.length){ toast("Không tìm thấy cột họ tên trong file này."); return; }
-    ui.xlsInfo = `Đã đọc <b>${best.names.length} học sinh</b> từ “${esc(f.name)}”${wb.SheetNames.length>1?`, trang “${esc(best.sheet)}”`:""} (${esc(best.how)}). Kiểm tra danh sách bên dưới rồi bấm <b>Thêm vào cuối danh sách</b> hoặc <b>Thay toàn bộ danh sách</b>.`;
-    render(); const ta=$("#paste"); if(ta){ ta.value=best.names.join("\n"); ta.focus(); }
-  }catch(err){ console.warn(err); toast("Không đọc được file. Hãy lưu lại dạng .xlsx rồi thử lại."); }
 });
 $("#backupIn").addEventListener("change", async e=>{
   const f=e.target.files[0]; e.target.value=""; if(!f) return;
@@ -1081,13 +1098,133 @@ $("#backupIn").addEventListener("change", async e=>{
     render(); toast(`Đã khôi phục ${n} mục`); }catch(err){ toast("Tệp sao lưu không hợp lệ."); }
 });
 
+/* ================= phone ⇄ computer link (peer-to-peer, for the stand-alone web version) ================= */
+const LINK_KEY="giothe.link";
+const link = { peer:null, conns:[], role:null, code:null, status:"off", retry:null };
+const inClaudeView = () => !!(window.claude && window.claude.use);
+function linkSupported(){ return !!window.Peer && !inClaudeView() && window.RTCPeerConnection; }
+function linkStore(v){ try{ if(v===undefined) return JSON.parse(localStorage.getItem(LINK_KEY)||"null"); localStorage.setItem(LINK_KEY, JSON.stringify(v)); }catch(e){ return null; } }
+function newCode(){ const a="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let c=""; for(let i=0;i<6;i++) c+=a[Math.floor(Math.random()*a.length)]; return c; }
+const peerId = code => "giothe-app-"+code.toLowerCase();
+function peerOpts(){ return Object.assign({debug:0, config:{iceServers:[{urls:"stun:stun.l.google.com:19302"},{urls:"stun:stun1.l.google.com:19302"}]}}, window.GIOTHE_PEER_OPTS||{}); }
+function peerSend(msg){ link.conns.forEach(c=>{ try{ if(c.open) c.send(msg); }catch(e){} }); }
+function fullState(){ return {t:"full", classes:S.classes, quizzes:S.quizzes, sessions:S.sessions, live:S.live, deleted:S.deleted||{}}; }
+function mergeFull(m){
+  S.deleted=Object.assign({}, m.deleted||{}, S.deleted||{});
+  for (const k of ["classes","quizzes","sessions"]){
+    for (const id in (m[k]||{})){
+      if (S.deleted[id]) continue;
+      const mine=S[k][id], theirs=m[k][id];
+      if (!mine || (theirs.updated||0) > (mine.updated||0)){
+        const keep = mine && mine.answers; S[k][id]=JSON.parse(JSON.stringify(theirs));
+        if (keep){ const a=S[k][id].answers=S[k][id].answers||{}; for(const qi in keep) a[qi]=Object.assign({}, keep[qi], a[qi]||{}); }
+      } else if (k==="sessions" && theirs.answers){ const a=mine.answers=mine.answers||{}; for(const qi in theirs.answers) a[qi]=Object.assign({}, theirs.answers[qi], a[qi]||{}); }
+    }
+    for (const id in S[k]) if (S.deleted[id]) delete S[k][id];
+  }
+  if (m.live && (!S.live || (m.live.updated||0) > (S.live.updated||0))) S.live=m.live;
+  saveLocal();
+}
+function onPeerMsg(m){
+  if (!m || typeof m!=="object") return;
+  if (m.t==="full") mergeFull(m);
+  else if (m.t==="put" && KIND[m.kind]) put(m.kind, m.obj, true);
+  else if (m.t==="del" && KIND[m.kind]) del(m.kind, m.id, true);
+  else if (m.t==="live"){ if(!m.live||!S.live||m.live.qi!==S.live.qi) for(const k in seen) delete seen[k]; setLive(m.live, true); if(!m.live && ui.cam) closeScanner(); }
+  else if (m.t==="ans") recordAnswers(m.sid, m.qi, m.map, true);
+  else return;
+  onRemoteChange();
+}
+function wireConn(conn){
+  conn.on("open", ()=>{ link.conns=link.conns.filter(c=>c!==conn&&c.open).concat(conn); conn.send(fullState()); setLinkStatus("on");
+    toast(link.role==="host"?"Đã kết nối điện thoại":"Đã kết nối với máy tính");
+    if (link.role==="host") setTimeout(()=>{ $("#linkModal").hidden=true; }, 1500); });
+  conn.on("data", onPeerMsg);
+  const gone=()=>{ link.conns=link.conns.filter(c=>c!==conn); if(!link.conns.length) setLinkStatus(link.role==="host"?"wait":"lost"); if(link.role==="client") scheduleRetry(); };
+  conn.on("close", gone); conn.on("error", gone);
+}
+function startHost(){
+  if (!linkSupported()) return;
+  if (link.peer && link.role==="host") return showLinkModal();
+  stopLink();
+  let st=linkStore(); if(!st||st.role!=="host"||!st.code) st={role:"host", code:newCode()};
+  link.role="host"; link.code=st.code; linkStore(st);
+  link.peer=new Peer(peerId(st.code), peerOpts());
+  setLinkStatus("wait"); showLinkModal();
+  link.peer.on("connection", conn=>wireConn(conn));
+  link.peer.on("error", e=>{ console.warn("peer",e);
+    if (e.type==="unavailable-id"){ stopLink(); linkStore({role:"host", code:newCode()}); startHost(); return; }
+    if (e.type==="network"||e.type==="server-error"||e.type==="socket-error") { setLinkStatus("err"); } });
+  link.peer.on("disconnected", ()=>{ try{ link.peer.reconnect(); }catch(e){} });
+}
+function startClient(code){
+  if (!linkSupported()) return;
+  code=String(code||"").trim().toUpperCase().replace(/[^A-Z0-9]/g,""); if(code.length<4) { toast("Mã kết nối gồm 6 ký tự."); return; }
+  stopLink();
+  link.role="client"; link.code=code; linkStore({role:"client", code});
+  link.peer=new Peer("giothe-c-"+uid(), peerOpts());
+  setLinkStatus("connecting");
+  link.peer.on("open", ()=>{ const conn=link.peer.connect(peerId(code), {reliable:true}); wireConn(conn);
+    setTimeout(()=>{ if(link.status==="connecting"){ setLinkStatus("lost"); scheduleRetry(); } }, 15000); });
+  link.peer.on("error", e=>{ console.warn("peer", e.type, e.message); if(e.type==="peer-unavailable"){ setLinkStatus("lost"); scheduleRetry(); } else if(link.status!=="on") setLinkStatus("err"); });
+  link.peer.on("disconnected", ()=>{ try{ link.peer.reconnect(); }catch(e){} });
+}
+function scheduleRetry(){
+  clearTimeout(link.retry);
+  link.retry=setTimeout(()=>{ if(link.role!=="client"||link.status==="on"||!link.peer) return;
+    if (link.peer.disconnected){ try{ link.peer.reconnect(); }catch(e){} }
+    setLinkStatus("connecting"); const conn=link.peer.connect(peerId(link.code),{reliable:true}); wireConn(conn);
+    setTimeout(()=>{ if(link.status==="connecting"){ setLinkStatus("lost"); scheduleRetry(); } }, 12000); }, 5000);
+}
+function stopLink(forget){
+  clearTimeout(link.retry); link.conns.forEach(c=>{try{c.close()}catch(e){}}); link.conns=[];
+  try{ link.peer&&link.peer.destroy(); }catch(e){} link.peer=null; link.role=null; setLinkStatus("off");
+  if (forget) linkStore(null);
+}
+function setLinkStatus(st){
+  link.status=st; const b=$("#linkBtn"); if(!b) return;
+  const n=link.conns.length;
+  const txt={off:"Kết nối điện thoại", wait:"Chờ điện thoại… "+(link.code||""), connecting:"Đang kết nối…", on: link.role==="host"?`Đã kết nối ${n} điện thoại`:"Đã kết nối máy tính", lost:"Mất kết nối — đang thử lại", err:"Lỗi kết nối"}[st];
+  b.querySelector("span").textContent=txt; b.classList.toggle("on", st==="on");
+  if (!$("#linkModal").hidden) renderLinkModal();
+}
+function linkUrl(){ return location.href.split("#")[0]+"#link-"+link.code; }
+function showLinkModal(){ $("#linkModal").hidden=false; renderLinkModal(); }
+function renderLinkModal(){
+  const body=$("#linkBody"); if(!body) return;
+  if (link.role==="host"){
+    body.innerHTML = `
+      <ol class="steps"><li>Mở <b>Camera</b> (hoặc Zalo → quét mã) trên điện thoại, hướng vào mã QR.</li><li>Chạm vào đường link hiện ra — app mở và tự kết nối.</li><li>Lớp, đề và kết quả quét sẽ đồng bộ giữa hai máy.</li></ol>
+      <div class="qr" id="qrBox"></div>
+      <div class="small muted" style="text-align:center">Hoặc trên điện thoại mở app → <b>Kết nối điện thoại</b> → nhập mã:</div>
+      <div class="code">${esc(link.code)}</div>
+      <div class="note small">${link.status==="on"?`✅ Đã kết nối ${link.conns.length} điện thoại.`:link.status==="err"?"Không kết nối được máy chủ trung gian. Kiểm tra mạng Internet rồi thử lại.":"Đang chờ điện thoại… Hai máy nên dùng <b>chung một mạng Wi-Fi</b> để kết nối ổn định nhất."}</div>
+      <div class="row"><button class="btn" data-act="linkClose">Xong</button><button class="btn ghost danger" data-act="linkStop">Ngắt kết nối</button></div>`;
+    if (window.QRCode){ new QRCode($("#qrBox"), {text:linkUrl(), width:440, height:440, correctLevel:QRCode.CorrectLevel.M}); }
+    else $("#qrBox").innerHTML=`<div style="line-height:1.4;color:#333;max-width:220px">${esc(linkUrl())}</div>`;
+  } else {
+    body.innerHTML = `
+      ${link.role==="client"?`<div class="note small">${link.status==="on"?"✅ Đã kết nối với máy tính (mã <b>"+esc(link.code)+"</b>).":link.status==="connecting"?"Đang kết nối với mã <b>"+esc(link.code)+"</b>…":"Chưa kết nối được với mã <b>"+esc(link.code)+"</b>. Kiểm tra máy tính đang mở app và hai máy dùng chung Wi-Fi — app sẽ tự thử lại."}</div>`:""}
+      <p class="muted small" style="margin:0">Đây là <b>máy tính</b> (máy trình chiếu)? Bấm “Hiện mã QR” rồi quét bằng điện thoại.<br>Đây là <b>điện thoại</b>? Nhập mã 6 ký tự đang hiện trên máy tính.</p>
+      <form id="linkForm" class="row" style="flex-wrap:nowrap"><input type="text" id="linkCode" placeholder="VD: K7M2QX" maxlength="8" autocomplete="off" autocapitalize="characters" style="font-family:var(--f-mono);font-size:1.1rem;letter-spacing:.1em"><button class="btn primary" type="submit">Kết nối</button></form>
+      <div class="row"><button class="btn" data-act="linkHost">Hiện mã QR (máy tính)</button>${link.role?`<button class="btn ghost danger" data-act="linkStop">Ngắt kết nối</button>`:""}</div>`;
+    $("#linkForm").addEventListener("submit", e=>{ e.preventDefault(); startClient($("#linkCode").value); renderLinkModal(); });
+  }
+}
+
 /* ================= boot ================= */
 loadLocal();
+const linkHash = (location.hash.match(/^#link-([A-Za-z0-9]{4,8})$/)||[])[1];
 ui.tab = tabFromHash() || (S.live ? "buoi" : "lop");
 (function logo(){ const cv=$("#logoCv"); if(!cv) return; const x=cv.getContext("2d"); x.fillStyle="#000"; x.fillRect(1,1,24,24); x.fillStyle="#fff";
   [[1,1],[2,3],[3,1],[4,2],[1,4],[3,4],[4,4],[2,2]].forEach(([c,r])=>x.fillRect(1+c*4.8,1+r*4.8,4.8,4.8)); })();
 render();
 initSync();
+if (linkSupported()){
+  $("#linkBtn").hidden=false;
+  if (linkHash){ try{ history.replaceState(null,"","#"+ui.tab); }catch(e){} startClient(linkHash); toast("Đang kết nối với máy tính…"); }
+  else { const st=linkStore(); if(st&&st.role==="host"&&st.code){ startHost(); $("#linkModal").hidden=true; } else if(st&&st.role==="client"&&st.code) startClient(st.code); }
+}
 </script>
 
 </body></html>
